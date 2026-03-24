@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES
-// Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,11 +21,18 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <algorithm>
 
 #include "NvInferPluginUtils.h"
 
 #include "isaac_ros_common/qos.hpp"
+#include "isaac_ros_nitros/types/nitros_type_manager.hpp"
 #include "isaac_ros_nitros_tensor_list_type/nitros_tensor_list.hpp"
+#include "isaac_ros_nitros_tensor_list_type/nitros_tensor_list_view.hpp"
+#include "isaac_ros_nitros_tensor_list_type/nitros_tensor_list_builder.hpp"
+#include "isaac_ros_nitros_tensor_list_type/nitros_tensor_builder.hpp"
+#include "std_msgs/msg/header.hpp"
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -37,61 +44,11 @@ namespace isaac_ros
 namespace dnn_inference
 {
 
-using nvidia::gxf::optimizer::GraphIOGroupSupportedDataTypesInfoList;
-
-constexpr char TENSOR_RT_ENTITY_NAME[] = "inference";
-constexpr char TENSOR_RT_COMPONENT_TYPE[] = "nvidia::gxf::TensorRtInference";
-
-constexpr char INPUT_COMPONENT_KEY[] = "inference/rx";
 constexpr char INPUT_DEFAULT_TENSOR_FORMAT[] = "nitros_tensor_list_nchw_rgb_f32";
 constexpr char INPUT_TOPIC_NAME[] = "tensor_pub";
 
-constexpr char OUTPUT_COMPONENT_KEY[] = "sink/sink";
 constexpr char OUTPUT_DEFAULT_TENSOR_FORMAT[] = "nitros_tensor_list_nhwc_rgb_f32";
 constexpr char OUTPUT_TOPIC_NAME[] = "tensor_sub";
-
-constexpr char APP_YAML_FILENAME[] = "config/tensor_rt_inference.yaml";
-constexpr char PACKAGE_NAME[] = "isaac_ros_tensor_rt";
-
-const std::vector<std::pair<std::string, std::string>> EXTENSIONS = {
-  {"isaac_ros_gxf", "gxf/lib/std/libgxf_std.so"},
-  {"isaac_ros_gxf", "gxf/lib/cuda/libgxf_cuda.so"},
-  {"isaac_ros_gxf", "gxf/lib/serialization/libgxf_serialization.so"},
-  {"gxf_isaac_tensor_rt", "gxf/lib/libgxf_isaac_tensor_rt.so"}
-};
-const std::vector<std::string> PRESET_EXTENSION_SPEC_NAMES = {
-  "isaac_ros_tensor_rt",
-};
-const std::vector<std::string> EXTENSION_SPEC_FILENAMES = {
-  "config/isaac_ros_tensor_rt.yaml"
-};
-const std::vector<std::string> GENERATOR_RULE_FILENAMES = {
-  "config/namespace_injector_rule.yaml"
-};
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-const nitros::NitrosPublisherSubscriberConfigMap CONFIG_MAP = {
-  {INPUT_COMPONENT_KEY,
-    {
-      .type = nitros::NitrosPublisherSubscriberType::NEGOTIATED,
-      .qos = rclcpp::QoS(1),
-      .compatible_data_format = INPUT_DEFAULT_TENSOR_FORMAT,
-      .topic_name = INPUT_TOPIC_NAME,
-      .use_compatible_format_only = true,
-    }
-  },
-  {OUTPUT_COMPONENT_KEY,
-    {
-      .type = nitros::NitrosPublisherSubscriberType::NEGOTIATED,
-      .qos = rclcpp::QoS(1),
-      .compatible_data_format = OUTPUT_DEFAULT_TENSOR_FORMAT,
-      .topic_name = OUTPUT_TOPIC_NAME,
-      .use_compatible_format_only = true,
-      .frame_id_source_key = INPUT_COMPONENT_KEY
-    }
-  }
-};
-#pragma GCC diagnostic pop
 
 namespace
 {
@@ -100,96 +57,130 @@ constexpr int64_t default_dla_core = -1;
 
 class TensorRT_Logger : public nvinfer1::ILogger
 {
+public:
   void log(Severity severity, const char * msg) noexcept override
   {
+    // Suppress logs below the desired severity level
+    if (severity > log_level) {
+      return;
+    }
+    if (severity == Severity::kINTERNAL_ERROR) {
+      RCLCPP_ERROR(rclcpp::get_logger("TRT"), "TRT INTERNAL_ERROR: %s", msg);
+    }
     if (severity == Severity::kERROR) {
       RCLCPP_ERROR(rclcpp::get_logger("TRT"), "TRT ERROR: %s", msg);
     }
+    if (severity == Severity::kINFO) {
+      RCLCPP_INFO(rclcpp::get_logger("TRT"), "TRT INFO: %s", msg);
+    }
+    if (severity == Severity::kWARNING) {
+      RCLCPP_WARN(rclcpp::get_logger("TRT"), "TRT WARNING: %s", msg);
+    }
+    if (severity == Severity::kVERBOSE) {
+      RCLCPP_DEBUG(rclcpp::get_logger("TRT"), "TRT VERBOSE: %s", msg);
+    }
   }
-} tensor_rt_logger;
 
-bool readTensorShapesFromEngine(
-  const std::string & engine_file_path, const std::vector<std::string> & binding_names,
-  std::vector<nvinfer1::Dims> & tensor_shapes,
-  std::vector<nvinfer1::DataType> & tensor_data_types)
+  void setReportableSeverity(Severity severity)
+  {
+    log_level = severity;
+  }
+
+private:
+  Severity log_level = Severity::kINFO;  // Default to INFO level;
+};
+TensorRT_Logger tensor_rt_logger;
+
+
+void CheckCudaError(cudaError_t result)
 {
-  // Try to load TensorRT engine and query model output dimension
-  std::vector<char> plan;
-  // Open the file in binary mode and seek to the end
-  std::ifstream file(engine_file_path, std::ios::binary | std::ios::ate);
-  if (!file) {
-    return false;
+  if (result != cudaSuccess) {
+    throw std::runtime_error("[TensorRTNode] CUDA error: " +
+                             std::string(cudaGetErrorString(result)) +
+                             " at " + __FILE__ + ":" + std::to_string(__LINE__));
   }
-
-  // Get the size of the file and seek back to the beginning
-  const size_t size = file.tellg();
-  file.seekg(0);
-  // Reserve enough space in the output buffer and read the file contents into it
-  plan.resize(size);
-  const bool ret = static_cast<bool>(file.read(plan.data(), size));
-  file.close();
-
-  if (!ret) {
-    return false;
-  }
-
-  // Add plugins from TRT
-  if (!initLibNvInferPlugins(&tensor_rt_logger, "")) {
-    return false;
-  }
-
-  std::unique_ptr<nvinfer1::IRuntime> infer_runtime(
-    nvinfer1::createInferRuntime(tensor_rt_logger));
-  std::unique_ptr<nvinfer1::ICudaEngine> cuda_engine(
-    infer_runtime->deserializeCudaEngine(plan.data(), plan.size()));
-
-  for (uint64_t i = 0; i < binding_names.size(); i++) {
-    const std::string & binding_name = binding_names[i];
-    tensor_shapes.push_back(cuda_engine->getTensorShape(binding_name.c_str()));
-    tensor_data_types.push_back(cuda_engine->getTensorDataType(binding_name.c_str()));
-  }
-
-  return true;
 }
 
-bool readTensorShapesFromOnnx(
-  const std::string & onnx_file_path, const size_t output_count,
-  std::vector<nvinfer1::Dims> & tensor_shapes,
-  std::vector<nvinfer1::DataType> & tensor_data_types)
+size_t GetElementSizeFromDataType(
+  nvinfer1::DataType data_type)
 {
-  std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(tensor_rt_logger));
-  std::unique_ptr<nvinfer1::IBuilderConfig> builderConfig(builder->createBuilderConfig());
-  std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(
-      1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH)));
-  std::unique_ptr<nvonnxparser::IParser> onnx_parser(
-    nvonnxparser::createParser(*network, tensor_rt_logger));
-  if (!onnx_parser->parseFromFile(
-      onnx_file_path.c_str(),
-      static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
-  {
-    return false;
+  size_t element_size = 1;
+  switch (data_type) {
+    case nvinfer1::DataType::kFLOAT:
+      element_size = sizeof(float);
+      break;
+    case nvinfer1::DataType::kHALF:
+      element_size = sizeof(uint16_t);
+      break;
+    case nvinfer1::DataType::kINT8:
+      element_size = sizeof(int8_t);
+      break;
+    case nvinfer1::DataType::kINT32:
+      element_size = sizeof(int32_t);
+      break;
+    case nvinfer1::DataType::kBOOL:
+      element_size = sizeof(bool);
+      break;
+    case nvinfer1::DataType::kUINT8:
+      element_size = sizeof(uint8_t);
+      break;
+    case nvinfer1::DataType::kINT64:
+      element_size = sizeof(int64_t);
+      break;
+    case nvinfer1::DataType::kBF16:
+      element_size = sizeof(uint16_t);
+      break;
+    case nvinfer1::DataType::kFP8:
+      element_size = sizeof(uint8_t);
+      break;
+    case nvinfer1::DataType::kINT4:
+      element_size = 1;  // 4 bits, round up
+      break;
+    case nvinfer1::DataType::kFP4:
+      element_size = 1;  // 4 bits, round up
+      break;
+    case nvinfer1::DataType::kE8M0:
+      element_size = sizeof(uint8_t);
+      break;
+    default:
+      element_size = 1;
+      break;
+  }
+  return element_size;
+}
+
+nvidia::isaac_ros::nitros::NitrosDataType GetNitrosDataTypeFromInferDataType(
+  nvinfer1::DataType infer_data_type)
+{
+  nvidia::isaac_ros::nitros::NitrosDataType nitros_data_type;
+  switch (infer_data_type) {
+    case nvinfer1::DataType::kFLOAT:
+      nitros_data_type = nvidia::isaac_ros::nitros::NitrosDataType::kFloat32;
+      break;
+    case nvinfer1::DataType::kINT8:
+      nitros_data_type = nvidia::isaac_ros::nitros::NitrosDataType::kInt8;
+      break;
+    case nvinfer1::DataType::kINT32:
+      nitros_data_type = nvidia::isaac_ros::nitros::NitrosDataType::kInt32;
+      break;
+    case nvinfer1::DataType::kINT64:
+      nitros_data_type = nvidia::isaac_ros::nitros::NitrosDataType::kInt64;
+      break;
+    case nvinfer1::DataType::kUINT8:
+      nitros_data_type = nvidia::isaac_ros::nitros::NitrosDataType::kUnsigned8;
+      break;
+    case nvinfer1::DataType::kHALF:
+    default:
+      throw std::runtime_error("[TensorRTNode] Unsupported tensor data type");
   }
 
-  for (uint64_t i = 0; i < output_count; i++) {
-    auto * bind_tensor = network->getOutput(i);
-    tensor_shapes.push_back(bind_tensor->getDimensions());
-    tensor_data_types.push_back(bind_tensor->getType());
-  }
-
-  return true;
+  return nitros_data_type;
 }
 
 }  // namespace
 
 TensorRTNode::TensorRTNode(const rclcpp::NodeOptions & options)
-: nitros::NitrosNode(options,
-    APP_YAML_FILENAME,
-    CONFIG_MAP,
-    PRESET_EXTENSION_SPEC_NAMES,
-    EXTENSION_SPEC_FILENAMES,
-    GENERATOR_RULE_FILENAMES,
-    EXTENSIONS,
-    PACKAGE_NAME),
+: rclcpp::Node("tensor_rt_node", options),
   model_file_path_(declare_parameter<std::string>("model_file_path", "model.onnx")),
   engine_file_path_(declare_parameter<std::string>("engine_file_path", "/tmp/trt_engine.plan")),
   custom_plugin_lib_(declare_parameter<std::string>("custom_plugin_lib", "")),
@@ -211,20 +202,27 @@ TensorRTNode::TensorRTNode(const rclcpp::NodeOptions & options)
 {
   RCLCPP_DEBUG(get_logger(), "[TensorRTNode] In TensorRTNode's constructor");
 
-  // This function sets the QoS parameter for publishers and subscribers setup by this NITROS node
+  // Initialize CUDA stream
+  CheckCudaError(cudaStreamCreate(&cuda_stream_));
+
+  // Set up QoS parameters
   rclcpp::QoS input_qos_ = ::isaac_ros::common::AddQosParameter(
-    *this, "DEFAULT",
-    "input_qos");
+    *this, "DEFAULT", "input_qos");
   rclcpp::QoS output_qos_ = ::isaac_ros::common::AddQosParameter(
-    *this, "DEFAULT",
-    "output_qos");
-  for (auto & config : config_map_) {
-    if (config.second.topic_name == INPUT_TOPIC_NAME) {
-      config.second.qos = input_qos_;
-    }
-    if (config.second.topic_name == OUTPUT_TOPIC_NAME) {
-      config.second.qos = output_qos_;
-    }
+    *this, "DEFAULT", "output_qos");
+
+  // Determine input and output formats
+  std::string input_format = INPUT_DEFAULT_TENSOR_FORMAT;
+  std::string output_format = OUTPUT_DEFAULT_TENSOR_FORMAT;
+
+  if (!input_tensor_formats_.empty()) {
+    input_format = input_tensor_formats_[0];
+    RCLCPP_INFO(get_logger(), "[TensorRTNode] Set input data format to: \"%s\"",
+            input_format.c_str());
+  }
+
+  if (!output_tensor_formats_.empty()) {
+    output_format = output_tensor_formats_[0];
   }
 
   if (engine_file_path_.empty()) {
@@ -234,45 +232,22 @@ TensorRTNode::TensorRTNode(const rclcpp::NodeOptions & options)
   }
 
   if (input_tensor_names_.empty()) {
-    throw std::invalid_argument(
-            "[TensorRTNode] Empty input_tensor_names, "
-            "this needs to be set based on the input tensor messages");
+    throw std::invalid_argument("[TensorRTNode] Empty input_tensor_names");
   }
 
   if (input_binding_names_.empty()) {
-    throw std::invalid_argument(
-            "[TensorRTNode] Empty input_binding_names, "
-            "this needs to be set per the model");
+    throw std::invalid_argument("[TensorRTNode] Empty input_binding_names");
   }
 
   if (output_tensor_names_.empty()) {
-    throw std::invalid_argument(
-            "[TensorRTNode] Empty output_tensor_names, "
-            "this needs to be set based on the desired output tensor messages");
+    throw std::invalid_argument("[TensorRTNode] Empty output_tensor_names");
   }
 
   if (output_binding_names_.empty()) {
-    throw std::invalid_argument("Empty output_binding_names, this needs to be set per the model");
+    throw std::invalid_argument("[TensorRTNode] Empty output_binding_names");
   }
 
-  if (!input_tensor_formats_.empty()) {
-    config_map_[INPUT_COMPONENT_KEY].compatible_data_format = input_tensor_formats_[0];
-    config_map_[INPUT_COMPONENT_KEY].use_compatible_format_only = true;
-    RCLCPP_INFO(
-      get_logger(),
-      "[TensorRTNode] Set input data format to: \"%s\"",
-      input_tensor_formats_[0].c_str());
-  }
-
-  if (!output_tensor_formats_.empty()) {
-    config_map_[OUTPUT_COMPONENT_KEY].compatible_data_format = output_tensor_formats_[0];
-    config_map_[OUTPUT_COMPONENT_KEY].use_compatible_format_only = true;
-    RCLCPP_INFO(
-      get_logger(),
-      "[TensorRTNode] Set output data format to: \"%s\"",
-      output_tensor_formats_[0].c_str());
-  }
-
+  // Note: Input and output formats are now handled during Managed NITROS initialization
   if (!custom_plugin_lib_.empty()) {
     if (!dlopen(custom_plugin_lib_.c_str(), RTLD_NOW)) {
       const char * error = dlerror();
@@ -281,153 +256,396 @@ TensorRTNode::TensorRTNode(const rclcpp::NodeOptions & options)
     }
     RCLCPP_INFO(
       get_logger(),
-      "[TensorRTNode] plugins: \"%s\" loaded successfully",
+      "[TensorRTNode] TRT plugins: \"%s\" loaded successfully",
       custom_plugin_lib_.c_str());
   }
 
-  registerSupportedType<nvidia::isaac_ros::nitros::NitrosTensorList>();
+  tensor_rt_logger.setReportableSeverity(nvinfer1::ILogger::Severity::kINFO);
+  // Initialize TensorRT engine
+  InitializeTensorRTEngine();
 
-  startNitrosNode();
+  // Create Managed NITROS subscriber for input tensors
+  input_sub_ = std::make_shared<nvidia::isaac_ros::nitros::ManagedNitrosSubscriber<
+        nvidia::isaac_ros::nitros::NitrosTensorListView>>(
+      this, INPUT_TOPIC_NAME, input_format,
+      std::bind(&TensorRTNode::InputTensorCallback, this, std::placeholders::_1),
+      nvidia::isaac_ros::nitros::NitrosDiagnosticsConfig{}, input_qos_);
+
+  // Create Managed NITROS publisher for output tensors
+  output_pub_ = std::make_shared<nvidia::isaac_ros::nitros::ManagedNitrosPublisher<
+        nvidia::isaac_ros::nitros::NitrosTensorList>>(
+      this, OUTPUT_TOPIC_NAME, output_format,
+      nvidia::isaac_ros::nitros::NitrosDiagnosticsConfig{}, output_qos_);
+
+  RCLCPP_INFO(get_logger(), "[TensorRTNode] TensorRT Node initialized successfully");
 }
 
-size_t TensorRTNode::determineMaxTensorBlockSize()
+void TensorRTNode::InitializeTensorRTEngine()
 {
-  std::vector<nvinfer1::Dims> shapes;
-  std::vector<nvinfer1::DataType> data_types;
+  RCLCPP_INFO(get_logger(), "Initializing TensorRT engine...");
 
-  const auto & tensor_names = output_binding_names_;
+  // Initialize TensorRT plugins
+  if (!initLibNvInferPlugins(&tensor_rt_logger, "")) {
+    throw std::runtime_error("[TensorRTNode] Failed to initialize TensorRT plugins");
+  }
 
-  // Read tensor information from engine or ONNX file.
-  if (readTensorShapesFromEngine(engine_file_path_, tensor_names, shapes, data_types)) {
-    RCLCPP_INFO(
-      get_logger(), "Read tensor shape information from TRT Model Engine: %s",
-      engine_file_path_.c_str());
-  } else if (readTensorShapesFromOnnx(model_file_path_, tensor_names.size(), shapes, data_types)) {
-    RCLCPP_INFO(
-      get_logger(), "Read tensor shape information from ONNX file: %s",
+  // Create TensorRT runtime
+  runtime_ = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(tensor_rt_logger));
+  if (!runtime_) {
+    throw std::runtime_error("[TensorRTNode] Failed to create TensorRT runtime");
+  }
+
+  // Try to load existing engine or build from model
+  if (std::filesystem::exists(engine_file_path_) && !force_engine_update_) {
+    LoadEngineFromFile();
+  } else {
+    BuildEngineFromModel();
+  }
+  if (!cuda_engine_) {
+    throw std::runtime_error("[TensorRTNode] Failed to create TensorRT engine");
+  }
+
+  // Create execution context
+  context_ = std::unique_ptr<nvinfer1::IExecutionContext>(cuda_engine_->createExecutionContext());
+  if (!context_) {
+    throw std::runtime_error("[TensorRTNode] Failed to create TensorRT execution context");
+  }
+
+  // Initialize binding information
+  SetupBindings();
+
+  // Binding Information
+  RCLCPP_INFO(get_logger(), "Number of CUDA bindings: %d", cuda_engine_->getNbIOTensors());
+  for (int32_t i = 0; i < cuda_engine_->getNbIOTensors(); ++i) {
+    RCLCPP_INFO(get_logger(), "Tensor name %s: Format %s",
+                cuda_engine_->getIOTensorName(i),
+                cuda_engine_->getTensorFormatDesc(cuda_engine_->getIOTensorName(i)));
+  }
+
+  RCLCPP_INFO(get_logger(), "TensorRT engine initialized successfully");
+}
+
+void TensorRTNode::InputTensorCallback(
+  const nvidia::isaac_ros::nitros::NitrosTensorListView & tensor_list)
+{
+  RCLCPP_DEBUG(get_logger(), "Received input tensor list");
+  try {
+    // Perform inference
+    auto output_tensor_list = DoInference(tensor_list);
+
+    // Publish result
+    output_pub_->publish(output_tensor_list);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(get_logger(), "Error during inference: %s", e.what());
+  }
+}
+
+nvidia::isaac_ros::nitros::NitrosTensorList TensorRTNode::DoInference(
+  const nvidia::isaac_ros::nitros::NitrosTensorListView & input_tensor_list)
+{
+  // Set input tensor addresses directly from input tensor buffers
+  for (size_t i = 0; i < input_binding_names_.size(); ++i) {
+    const std::string & binding_name = input_binding_names_[i];
+    const std::string & tensor_name = input_tensor_names_[i];
+
+    auto input_tensor = input_tensor_list.GetNamedTensor(tensor_name);
+
+    // Updates the latest dimension of input tensor
+    nvinfer1::Dims dims = input_binding_dims_[binding_name];
+    if (!context_->setInputShape(binding_name.c_str(), dims)) {
+      throw std::runtime_error("[TensorRTNode] Failed to update input binding dimensions: " +
+                               binding_name);
+    }
+
+    // Set tensor address directly to input tensor buffer (no copy needed)
+    if (!context_->setTensorAddress(binding_name.c_str(),
+            static_cast<void *>(const_cast<unsigned char *>(input_tensor.GetBuffer()))))
+    {
+      throw std::runtime_error(
+        "[TensorRTNode] Failed to set input tensor address for: " +
+        binding_name);
+    }
+  }
+
+  // Set output tensor addresses
+  for (size_t i = 0; i < output_binding_names_.size(); ++i) {
+    const std::string & binding_name = output_binding_names_[i];
+
+    void * binding_ptr;
+    size_t binding_size = output_binding_infos_[binding_name];
+    CheckCudaError(cudaMallocAsync(&binding_ptr, binding_size, cuda_stream_));
+
+    // Set tensor address for TensorRT execution context
+    if (!context_->setTensorAddress(binding_name.c_str(), binding_ptr)) {
+      throw std::runtime_error(
+        "[TensorRTNode] Failed to set output tensor address for: " +
+        binding_name);
+    }
+  }
+
+  // Execute inference
+  if (!context_->enqueueV3(cuda_stream_)) {
+    throw std::runtime_error("[TensorRTNode] TensorRT inference failed");
+  }
+
+  // Synchronize stream
+  CheckCudaError(cudaStreamSynchronize(cuda_stream_));
+
+  // Create header for output
+  std_msgs::msg::Header header;
+  header.frame_id = input_tensor_list.GetFrameId();
+  header.stamp.sec = input_tensor_list.GetTimestampSeconds();
+  header.stamp.nanosec = input_tensor_list.GetTimestampNanoseconds();
+
+  // Build output tensor list
+  nvidia::isaac_ros::nitros::NitrosTensorListBuilder builder;
+  builder.WithHeader(header);
+
+  for (size_t i = 0; i < output_binding_names_.size(); ++i) {
+    const std::string & binding_name = output_binding_names_[i];
+    const std::string & tensor_name = output_tensor_names_[i];
+
+    void * output_data = context_->getOutputTensorAddress(binding_name.c_str());
+    if (!output_data) {
+      throw std::runtime_error("[TensorRTNode] Failed to get output tensor address: " +
+                               binding_name);
+    }
+
+    auto tensor_dims = cuda_engine_->getTensorShape(binding_name.c_str());
+
+    // Convert TensorRT dimensions to vector for NitrosTensorShape
+    std::vector<int32_t> shape_dims;
+    for (int j = 0; j < tensor_dims.nbDims; ++j) {
+      shape_dims.push_back(tensor_dims.d[j]);
+    }
+    nvidia::isaac_ros::nitros::NitrosTensorShape shape(shape_dims);
+
+    auto tensor_data_type = cuda_engine_->getTensorDataType(binding_name.c_str());
+    auto nitros_data_type = GetNitrosDataTypeFromInferDataType(tensor_data_type);
+
+    // Build tensor
+    nvidia::isaac_ros::nitros::NitrosTensorBuilder tensor_builder;
+    auto output_tensor = tensor_builder
+      .WithShape(shape)
+      .WithDataType(nitros_data_type)
+      .WithData(output_data)
+      .WithReleaseCallback([output_data, stream = cuda_stream_]() {
+          cudaFreeAsync(output_data, stream);
+      })
+      .Build();
+
+    builder.AddTensor(tensor_name, std::move(output_tensor));
+  }
+
+  return builder.Build();
+}
+
+void TensorRTNode::LoadEngineFromFile()
+{
+  std::ifstream file(engine_file_path_, std::ios::binary | std::ios::ate);
+  if (!file) {
+    throw std::runtime_error("[TensorRTNode] Cannot open engine file: " + engine_file_path_);
+  }
+
+  const size_t size = file.tellg();
+  file.seekg(0);
+
+  std::vector<char> engine_data(size);
+  if (!file.read(engine_data.data(), size)) {
+    throw std::runtime_error("[TensorRTNode] Failed to read engine file");
+  }
+
+  cuda_engine_ = std::unique_ptr<nvinfer1::ICudaEngine>(
+    runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
+  RCLCPP_INFO(get_logger(), "Loaded TensorRT engine from file: %s successfully",
+    engine_file_path_.c_str());
+}
+
+void TensorRTNode::BuildEngineFromModel()
+{
+  RCLCPP_INFO(get_logger(), "Building TensorRT engine from model: %s", model_file_path_.c_str());
+
+  if (!std::filesystem::exists(model_file_path_)) {
+    throw std::runtime_error("[TensorRTNode] Model file does not exist: " + model_file_path_);
+  }
+
+  // Create builder
+  std::unique_ptr<nvinfer1::IBuilder> builder(
+    nvinfer1::createInferBuilder(tensor_rt_logger));
+  if (!builder) {
+    throw std::runtime_error("[TensorRTNode] Failed to create TensorRT builder");
+  }
+
+  // Create builder config
+  std::unique_ptr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
+  if (!config) {
+    throw std::runtime_error("[TensorRTNode] Failed to create TensorRT builder config");
+  }
+  config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+  // Set max workspace size
+  config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, max_workspace_size_);
+
+  // Enable FP16 if requested
+  if (enable_fp16_) {
+    // kFP16 flag has been deprecated starting with TensorRT 10.12
+    // If your hardware supports TF32 (TensorFloat32), you can enable it with
+    // builder.setFlag(nvinfer1::BuilderFlag::kTF32).
+    // TF32 offers near-FP32 precision with FP16-like performance on compatible GPUs.
+    // check the support matrix for more details:
+    // https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/support-matrix.html
+    config->setFlag(nvinfer1::BuilderFlag::kTF32);
+    RCLCPP_INFO(get_logger(), "[TensorRTNode] FP16 mode enabled");
+  }
+
+  // Set DLA core if specified
+  if (dla_core_ != default_dla_core && builder->getNbDLACores() > 0) {
+    config->setDefaultDeviceType(nvinfer1::DeviceType::kDLA);
+    config->setFlag(nvinfer1::BuilderFlag::kGPU_FALLBACK);
+    config->setDLACore(dla_core_);
+    RCLCPP_INFO(get_logger(), "[TensorRTNode] Using DLA core: %ld", dla_core_);
+  }
+
+  // Create network
+  std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(0));
+  if (!network) {
+    throw std::runtime_error("[TensorRTNode] Failed to create TensorRT network");
+  }
+
+  // Parse ONNX model
+  std::unique_ptr<nvonnxparser::IParser> parser(
+    nvonnxparser::createParser(*network, tensor_rt_logger));
+  if (!parser) {
+    throw std::runtime_error("[TensorRTNode] Failed to create ONNX parser");
+  }
+
+  if (!parser->parseFromFile(
+      model_file_path_.c_str(),
+      static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE)))
+  {
+    RCLCPP_ERROR(get_logger(), "[TensorRTNode] Failed to parse ONNX model: %s",
       model_file_path_.c_str());
-  } else {
-    RCLCPP_ERROR(
-      get_logger(),
-      "Unable to read tensor shape info from TRT Model Engine or from ONNX file.");
-    return 0;
+    throw std::runtime_error("[TensorRTNode] Failed to parse ONNX model");
   }
 
-  // Calculate maximum number of bytes needed for any single output tensor.
-  size_t max_tensor_size_bytes = 1;
-  for (uint64_t i = 0; i < shapes.size(); i++) {
-    const auto & shape = shapes[i];
-    const auto data_type = data_types[i];
+  // Provides optimization profile for dynamic size input bindings
+  nvinfer1::IOptimizationProfile * optimization_profile = builder->createOptimizationProfile();
+  // Checks input dimensions and adds to optimization profile if needed
+  const int number_inputs = network->getNbInputs();
+  for (int i = 0; i < number_inputs; ++i) {
+    auto * bind_tensor = network->getInput(i);
+    const char * bind_name = bind_tensor->getName();
+    nvinfer1::Dims dims = bind_tensor->getDimensions();
 
-    uint64_t tensor_element_count = 1;
-    for (int j = 0; j < shape.nbDims; j++) {
-      tensor_element_count *= std::max(shape.d[j], 1L);
+    // Validates binding info
+    if (dims.nbDims <= 0) {
+      throw std::runtime_error("[TensorRTNode] Invalid input tensor dimensions for binding " +
+                               std::string(bind_name));
     }
-
-    uint64_t bytes_per_element;
-    switch (data_type) {
-      case nvinfer1::DataType::kINT8:  bytes_per_element = sizeof(int8_t); break;
-      case nvinfer1::DataType::kFLOAT: bytes_per_element = sizeof(float_t); break;
-      case nvinfer1::DataType::kINT32: bytes_per_element = sizeof(int32_t); break;
-
-      // Fallback to max size of 8 bytes (64 bits) for other types
-      default: bytes_per_element = sizeof(size_t);
+    for (int j = 1; j < dims.nbDims; ++j) {
+      if (dims.d[j] <= 0) {
+        RCLCPP_ERROR(get_logger(),
+            "Input binding %s requires dynamic size on dimension No.%d which is not supported",
+            bind_tensor->getName(), j);
+        throw std::runtime_error("[TensorRTNode] Input binding " + std::string(bind_name) +
+                                 " requires dynamic size on dimension No." + std::to_string(j) +
+                                 " which is not supported");
+      }
     }
-
-    const size_t tensor_size_bytes = tensor_element_count * bytes_per_element;
-    max_tensor_size_bytes = std::max(max_tensor_size_bytes, tensor_size_bytes);
+    if (dims.d[0] == -1) {
+      // Only case with first dynamic dimension is supported and assumed to be batch size.
+      // Always optimizes for 1-batch.
+      dims.d[0] = 1;
+      optimization_profile->setDimensions(bind_name, nvinfer1::OptProfileSelector::kMIN, dims);
+      optimization_profile->setDimensions(bind_name, nvinfer1::OptProfileSelector::kOPT, dims);
+      dims.d[0] = max_batch_size_;
+      if (max_batch_size_ <= 0) {
+        RCLCPP_ERROR(get_logger(),
+          "[TensorRTNode] Maximum batch size %d is invalid. Uses 1 instead.", max_batch_size_);
+        dims.d[0] = 1;
+      }
+      optimization_profile->setDimensions(bind_name, nvinfer1::OptProfileSelector::kMAX, dims);
+    }
   }
+  config->addOptimizationProfile(optimization_profile);
 
-  return max_tensor_size_bytes;
+  // Build engine
+  std::unique_ptr<nvinfer1::IHostMemory> serialized_engine(builder->buildSerializedNetwork(
+                                                           *network, *config));
+  if (!serialized_engine) {
+    throw std::runtime_error("[TensorRTNode] Failed to build TensorRT engine");
+  }
+  if (serialized_engine->size() == 0 || serialized_engine->data() == nullptr) {
+    throw std::runtime_error("[TensorRTNode] Fail to serialize TensorRT Engine.");
+  }
+  RCLCPP_INFO(get_logger(), "[TensorRTNode] Serialized engine size: %zu",
+    static_cast<size_t>(serialized_engine->size()));
+
+  // Deserialize engine to a file for future use
+  cuda_engine_ = std::unique_ptr<nvinfer1::ICudaEngine>(
+    runtime_->deserializeCudaEngine(serialized_engine->data(), serialized_engine->size()));
+
+  // Save engine to file
+  std::ofstream engine_file(engine_file_path_, std::ios::binary);
+  if (engine_file.good()) {
+    engine_file.write(static_cast<const char *>(serialized_engine->data()),
+            serialized_engine->size());
+    RCLCPP_INFO(get_logger(), "[TensorRTNode] Saved TensorRT engine to: %s",
+            engine_file_path_.c_str());
+  }
+  RCLCPP_INFO(get_logger(), "Input bindings setup completed");
 }
 
-
-void TensorRTNode::postLoadGraphCallback()
+void TensorRTNode::SetupBindings()
 {
-  RCLCPP_INFO(get_logger(), "In TensorRTNode postLoadGraphCallback().");
+  const int num_bindings = cuda_engine_->getNbIOTensors();
+  bool binding_is_input = false;
 
-  uint64_t block_size = determineMaxTensorBlockSize();
-  if (!block_size) {
-    block_size = default_max_workspace_size;
-    RCLCPP_WARN(
-      get_logger(), "Failed to get block size from model, set to the default size: %ld.",
-      default_max_workspace_size);
+  for (int i = 0; i < num_bindings; ++i) {
+    const char * tensor_name = cuda_engine_->getIOTensorName(i);
+    auto binding_dims = cuda_engine_->getTensorShape(tensor_name);
+    auto binding_data_type = cuda_engine_->getTensorDataType(tensor_name);
+    binding_is_input = cuda_engine_->getTensorIOMode(tensor_name) ==
+      nvinfer1::TensorIOMode::kINPUT;
+
+    // Calculate binding size
+    size_t binding_size = 1;
+    for (int j = 0; j < binding_dims.nbDims; ++j) {
+      binding_size *= std::max(binding_dims.d[j], 1L);
+    }
+
+    // Get element size
+    size_t element_size = GetElementSizeFromDataType(binding_data_type);
+    binding_size = binding_size * element_size;
+    if (binding_is_input) {
+      input_binding_dims_[tensor_name] = binding_dims;
+    } else {
+      output_binding_infos_[tensor_name] = binding_size;
+    }
+
+    RCLCPP_DEBUG(get_logger(), "[TensorRTNode] Binding %d: %s (%s) - "
+                               "dims: %d of type - size: %zu bytes (total: %zu bytes)",
+                i, tensor_name, binding_is_input ? "input" : "output", binding_dims.nbDims,
+                binding_size, binding_size);
   }
-  getNitrosContext().setParameterUInt64(
-    TENSOR_RT_ENTITY_NAME, "nvidia::gxf::BlockMemoryPool", "block_size", block_size);
-
-  const uint64_t output_num_blocks = output_tensor_names_.size() * num_blocks_;
-  getNitrosContext().setParameterUInt64(
-    TENSOR_RT_ENTITY_NAME, "nvidia::gxf::BlockMemoryPool", "num_blocks", output_num_blocks);
-
-  RCLCPP_INFO(
-    get_logger(), "Tensors %ld bytes, num outputs %ld x tensors per output %ld = %ld blocks",
-    block_size, num_blocks_, output_tensor_names_.size(), output_num_blocks);
-
-
-  if (!force_engine_update_ && model_file_path_.empty()) {
-    getNitrosContext().setParameterStr(
-      TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "model_file_path",
-      "model.onnx");
-  } else {
-    getNitrosContext().setParameterStr(
-      TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "model_file_path",
-      model_file_path_);
-  }
-
-  getNitrosContext().setParameterStr(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "engine_file_path",
-    engine_file_path_);
-
-  getNitrosContext().setParameterBool(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "force_engine_update",
-    force_engine_update_);
-
-  getNitrosContext().setParameterBool(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "verbose",
-    verbose_);
-
-  getNitrosContext().setParameter1DStrVector(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "input_tensor_names",
-    input_tensor_names_);
-
-  getNitrosContext().setParameter1DStrVector(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "input_binding_names",
-    input_binding_names_);
-
-  getNitrosContext().setParameter1DStrVector(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "output_tensor_names",
-    output_tensor_names_);
-
-  getNitrosContext().setParameter1DStrVector(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "output_binding_names",
-    output_binding_names_);
-
-  getNitrosContext().setParameterInt64(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "max_workspace_size",
-    max_workspace_size_);
-
-  // Only set DLA core if user sets in node options
-  if (dla_core_ != default_dla_core) {
-    getNitrosContext().setParameterInt64(
-      TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE,
-      "dla_core", dla_core_);
-  }
-
-  getNitrosContext().setParameterInt32(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "max_batch_size",
-    max_batch_size_);
-
-  getNitrosContext().setParameterBool(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE,
-    "enable_fp16_", enable_fp16_);
-
-  getNitrosContext().setParameterBool(
-    TENSOR_RT_ENTITY_NAME, TENSOR_RT_COMPONENT_TYPE, "relaxed_dimension_check",
-    relaxed_dimension_check_);
 }
 
-TensorRTNode::~TensorRTNode() {}
+TensorRTNode::~TensorRTNode() noexcept
+{
+  // Clean up CUDA resources
+  if (cuda_stream_) {
+    cudaError_t err = cudaStreamDestroy(cuda_stream_);
+    if (err != cudaSuccess) {
+      RCLCPP_ERROR(get_logger(), "Failed to destroy CUDA stream: %s",
+                   cudaGetErrorString(err));
+    }
+  }
+
+  cuda_stream_ = nullptr;
+  input_binding_dims_.clear();
+  output_binding_infos_.clear();
+
+  RCLCPP_INFO(get_logger(), "TensorRT engine cleaned up successfully");
+}
 
 }  // namespace dnn_inference
 }  // namespace isaac_ros

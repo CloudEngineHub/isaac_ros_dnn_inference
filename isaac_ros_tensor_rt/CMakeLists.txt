@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES
-# Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ if(BUILD_TESTING)
   target_link_libraries(tensor_rt_node_test tensor_rt_node)
   target_include_directories(tensor_rt_node_test PUBLIC include/)
   ament_target_dependencies(tensor_rt_node_test rclcpp)
-  ament_target_dependencies(tensor_rt_node_test isaac_ros_nitros)
+  ament_target_dependencies(tensor_rt_node_test isaac_ros_managed_nitros)
 
   # The FindPythonInterp and FindPythonLibs modules are removed
   if(POLICY CMP0148)
@@ -66,7 +66,7 @@ if(BUILD_TESTING)
   endif()
 
   find_package(launch_testing_ament_cmake REQUIRED)
-  add_launch_test(test/isaac_ros_tensor_rt_test.py TIMEOUT "300")
+  add_launch_test(test/isaac_ros_tensor_rt_test.py TIMEOUT "500")
 endif()
 
 
@@ -75,4 +75,4 @@ ament_index_get_resource(ISAAC_ROS_COMMON_CMAKE_PATH isaac_ros_common_cmake_path
 include("${ISAAC_ROS_COMMON_CMAKE_PATH}/isaac_ros_common-version-info.cmake")
 generate_version_info(${PROJECT_NAME})
 
-ament_auto_package(INSTALL_TO_SHARE config launch)
+ament_auto_package(INSTALL_TO_SHARE launch)

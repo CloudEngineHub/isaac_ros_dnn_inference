@@ -97,7 +97,7 @@ class IsaacROSTensorRTNodeTest(IsaacROSBaseTest):
     RANK = 2
     STRIDES = [4000, 4]
     DATA_LENGTH = 4000
-    MODEL_GENERATION_TIMEOUT_SEC = 300
+    MODEL_GENERATION_TIMEOUT_SEC = 400
     GXF_WAIT_SEC = 10
     MODEL_PATH = '/tmp/trt_engine.plan'
 
