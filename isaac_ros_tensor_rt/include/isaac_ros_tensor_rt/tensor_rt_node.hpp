@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES
-// Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,17 +18,26 @@
 #ifndef ISAAC_ROS_TENSOR_RT__TENSOR_RT_NODE_HPP_
 #define ISAAC_ROS_TENSOR_RT__TENSOR_RT_NODE_HPP_
 
+#include <cuda_runtime.h>
+
+#include <functional>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
-#include <memory>
 
 #include "NvInferPlugin.h"
 #include "NvOnnxConfig.h"
 #include "NvOnnxParser.h"
 
 #include "rclcpp/rclcpp.hpp"
-#include "isaac_ros_nitros/nitros_node.hpp"
+#include "isaac_ros_nitros/types/nitros_type_base.hpp"
+#include "isaac_ros_managed_nitros/managed_nitros_publisher.hpp"
+#include "isaac_ros_managed_nitros/managed_nitros_subscriber.hpp"
+#include "isaac_ros_nitros_tensor_list_type/nitros_tensor_list.hpp"
+#include "isaac_ros_nitros_tensor_list_type/nitros_tensor_list_view.hpp"
+#include "isaac_ros_nitros_tensor_list_type/nitros_tensor_list_builder.hpp"
 
 using StringList = std::vector<std::string>;
 
@@ -40,7 +49,7 @@ namespace isaac_ros
 namespace dnn_inference
 {
 
-class TensorRTNode : public nitros::NitrosNode
+class TensorRTNode : public rclcpp::Node
 {
 public:
   explicit TensorRTNode(const rclcpp::NodeOptions &);
@@ -51,8 +60,24 @@ public:
 
   TensorRTNode & operator=(const TensorRTNode &) = delete;
 
-  // The callback for submitting parameters to the node's graph
-  void postLoadGraphCallback() override;
+  // Callback for processing input tensor list
+  void InputTensorCallback(const nitros::NitrosTensorListView & tensor_list);
+
+  // Method to perform TensorRT inference
+  nitros::NitrosTensorList DoInference(
+    const nvidia::isaac_ros::nitros::NitrosTensorListView & input_tensor_list);
+
+  // Initialize TensorRT engine and related components
+  void InitializeTensorRTEngine();
+
+  // Load TensorRT engine from file
+  void LoadEngineFromFile();
+
+  // Build TensorRT engine from ONNX model
+  void BuildEngineFromModel();
+
+  // Setup binding information for inputs and outputs
+  void SetupBindings();
 
 private:
   // TensorRT Inference Parameters
@@ -79,7 +104,25 @@ private:
   const bool relaxed_dimension_check_;
   const int64_t num_blocks_;
 
-  size_t determineMaxTensorBlockSize();
+  // Managed NITROS subscriber for input tensors
+  std::shared_ptr<nvidia::isaac_ros::nitros::ManagedNitrosSubscriber<
+      nvidia::isaac_ros::nitros::NitrosTensorListView>> input_sub_;
+
+  // Managed NITROS publisher for output tensors
+  std::shared_ptr<nvidia::isaac_ros::nitros::ManagedNitrosPublisher<
+      nvidia::isaac_ros::nitros::NitrosTensorList>> output_pub_;
+
+  // TensorRT inference engine
+  std::unique_ptr<nvinfer1::ICudaEngine> cuda_engine_;
+  std::unique_ptr<nvinfer1::IRuntime> runtime_;
+  std::unique_ptr<nvinfer1::IExecutionContext> context_;
+
+  // CUDA stream for inference
+  cudaStream_t cuda_stream_;
+
+  // Binding information
+  std::unordered_map<std::string, size_t> output_binding_infos_;
+  std::unordered_map<std::string, nvinfer1::Dims> input_binding_dims_;
 };
 
 }  // namespace dnn_inference
